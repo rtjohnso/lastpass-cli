@@ -54,6 +54,11 @@ struct share_args {
 	bool set_admin;
 	bool hide_passwords;
 	bool set_hide_passwords;
+
+	bool whitelist;
+	bool add;
+	bool remove;
+	bool clear;
 };
 
 struct share_command {
@@ -68,6 +73,7 @@ struct share_command {
 #define share_usermod_usage "usermod [--read-only=[true|false] --hidden=[true|false] --admin=[true|false] SHARE USERNAME"
 #define share_userdel_usage "userdel SHARE USERNAME"
 #define share_create_usage "create SHARE"
+#define share_limit_usage "limit [--whitelist] SHARE USERNAME [sites]"
 #define share_rm_usage "rm SHARE"
 
 static char *checkmark(int x) {
@@ -221,6 +227,123 @@ static int share_userdel(struct share_command *cmd, int argc, char **argv,
 	return 0;
 }
 
+static void print_share_limits(struct blob *blob, struct share *share,
+			       struct share_limit *limit)
+{
+	struct account *account;
+	struct share_limit_aid *aid;
+	char sitename[80];
+
+	/* display current settings for this user */
+	terminal_printf(TERMINAL_FG_YELLOW TERMINAL_BOLD
+			"%-60s %7s %5s" TERMINAL_RESET "\n",
+			"Site", "Unavail", "Avail");
+
+	list_for_each_entry(account, &blob->account_head, list) {
+		if (account->share != share)
+			continue;
+
+		bool in_list = false;
+		list_for_each_entry(aid, &limit->aid_list, list) {
+			if (!strcmp(aid->aid, account->id)) {
+				in_list = true;
+			}
+		}
+
+		bool avail = (in_list && limit->whitelist) ||
+			(!in_list && !limit->whitelist);
+
+		snprintf(sitename, sizeof(sitename),
+				TERMINAL_BOLD "%-.30s" TERMINAL_NO_BOLD " [id: %s]",
+				account->name, account->id);
+
+		terminal_printf(TERMINAL_FG_GREEN
+				"%-66s" TERMINAL_RESET " %8s %5s\n",
+				sitename, checkmark(!avail), checkmark(avail));
+
+	}
+}
+
+
+static int share_limit(struct share_command *cmd, int argc, char **argv,
+		       struct share_args *args)
+{
+	struct share_user *found;
+	struct share_limit limit;
+	struct account *account;
+	struct share_limit_aid *aid, *tmp;
+	struct blob *blob = args->blob;
+	int optind;
+
+	struct list_head potential_set;
+	struct list_head matches;
+
+	if (argc < 1)
+		die_share_usage(cmd);
+
+	found = get_user_from_share(args->session, args->share, argv[0]);
+	lastpass_share_get_limits(args->session, args->share, found, &limit);
+
+	if (argc == 1) {
+		/* nothing to do, just print current limits */
+		print_share_limits(blob, args->share, &limit);
+		return 0;
+	}
+
+	/* add to, or subtract from current list */
+	INIT_LIST_HEAD(&potential_set);
+	INIT_LIST_HEAD(&matches);
+
+	/* search only accts in this share */
+	list_for_each_entry(account, &blob->account_head, list) {
+		if (account->share == args->share)
+			list_add(&account->match_list, &potential_set);
+	}
+
+	for (optind = 1; optind < argc; optind++) {
+		char *name = argv[optind];
+		find_matching_accounts(&potential_set, name, &matches);
+	}
+
+	if (args->clear) {
+		list_for_each_entry_safe(aid, tmp, &limit.aid_list, list) {
+			list_del(&aid->list);
+			free(aid->aid);
+		}
+	}
+
+	list_for_each_entry(account, &matches, match_list) {
+
+		/* add account to share_limit */
+		bool in_list = false;
+		list_for_each_entry(aid, &limit.aid_list, list) {
+			if (!strcmp(aid->aid, account->id)) {
+				in_list = true;
+				break;
+			}
+		}
+
+		if ((!in_list && args->add) || args->clear) {
+			struct share_limit_aid *newaid =
+				new0(struct share_limit_aid, 1);
+			newaid->aid = account->id;
+			list_add_tail(&newaid->list, &limit.aid_list);
+		}
+		else if (in_list && args->remove) {
+			list_del(&aid->list);
+		}
+	}
+
+	/* update list type if changed */
+	limit.whitelist = args->whitelist;
+
+	lastpass_share_set_limits(args->session, args->share, found, &limit);
+
+	print_share_limits(blob, args->share, &limit);
+
+	return 0;
+}
+
 static int share_create(struct share_command *cmd, int argc, char **argv,
 			struct share_args *args)
 {
@@ -253,6 +376,7 @@ static struct share_command share_commands[] = {
 	SHARE_CMD(userdel),
 	SHARE_CMD(create),
 	SHARE_CMD(rm),
+	SHARE_CMD(limit),
 };
 #undef SHARE_CMD
 
@@ -277,6 +401,10 @@ int cmd_share(int argc, char **argv)
 		{"read-only", required_argument, NULL, 'r'},
 		{"hidden", required_argument, NULL, 'H'},
 		{"admin", required_argument, NULL, 'a'},
+		{"whitelist", no_argument, NULL, 'w'},
+		{"add", no_argument, NULL, 'A'},
+		{"rm", no_argument, NULL, 'R'},
+		{"clear", no_argument, NULL, 'c'},
 		{0, 0, 0, 0}
 	};
 
@@ -284,6 +412,7 @@ int cmd_share(int argc, char **argv)
 		.sync = BLOB_SYNC_AUTO,
 		.read_only = true,
 		.hide_passwords = true,
+		.add = true,
 	};
 
 	bool invalid_params = false;
@@ -299,7 +428,7 @@ int cmd_share(int argc, char **argv)
 	 */
 	int option;
 	int option_index;
-	while ((option = getopt_long(argc, argv, "S:C:r:H:a:", long_options, &option_index)) != -1) {
+	while ((option = getopt_long(argc, argv, "S:C:r:H:a:wARc", long_options, &option_index)) != -1) {
 		switch (option) {
 			case 'S':
 				args.sync = parse_sync_string(optarg);
@@ -320,6 +449,21 @@ int cmd_share(int argc, char **argv)
 			case 'a':
 				args.admin = parse_bool_arg_string(optarg);
 				args.set_admin = true;
+				break;
+			case 'w':
+				args.whitelist = true;
+				break;
+			case 'A':
+				args.add = true;
+				args.remove = args.clear = false;
+				break;
+			case 'R':
+				args.remove = true;
+				args.add = args.clear = false;
+				break;
+			case 'c':
+				args.clear = true;
+				args.add = args.remove = false;
 				break;
 			case '?':
 			default:
